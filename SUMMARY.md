@@ -1,6 +1,4 @@
-# TypeScript Notes
-
-## Start Here
+# Table of contents
 
 - [Roadmap](Roadmap.md)
 
