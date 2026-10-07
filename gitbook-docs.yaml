@@ -1,0 +1,13 @@
+$schema: https://api.gitbook.com/gitbook-docs.yaml
+
+site:
+  title: TypeScript Notes
+
+structure:
+  - type: space
+    key: typescript-notes
+    title: TypeScript Notes
+    path: typescript-notes
+    default: true
+    content:
+      directory: ./
