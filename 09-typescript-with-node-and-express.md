@@ -1126,6 +1126,345 @@ Typing `res` as `Response<ApiResponse<User>>` helps only where you actually use 
 - The error handler needs four parameters, goes last, maps `AppError` and known library errors, and hides internals in production.
 - One typed `ApiResponse<T>` envelope for every endpoint keeps the frontend simple.
 
-✅ Part 9b complete. Say "next" for Part 9c
+✅ Part 9b complete.
 
 Correction: in 9.12, the first `validate` block I showed has two real mistakes (`res` is not in scope, and `req.query` can't be reassigned in Express 5). Use the `validateBody` version below it, and parse query inside the controller.
+
+---
+
+# Part 9c: Testing, NestJS Intro & Deployment
+
+**Assumptions:** same project as 9a/9b (Express 5, ESM, Zod `env`). Testing uses **Vitest**, which works with ESM and TypeScript with little setup. Jest is covered as the legacy option you will meet in older codebases.
+
+---
+
+## 9.15 Testing with Vitest (and Jest + ts-jest) 🔴 MUST KNOW
+
+**1. What it is**
+Automated tests that call your code and check the results. Layers 9a built (controller, service, repository) make this easy:
+
+- **Unit tests:** one service with a fake repository, no HTTP.
+- **Integration tests:** real Express `app` with `supertest`, no open port.
+
+**2. Why it exists**
+TS proves types match. Tests prove behavior is right (the right status code, the right error for a missing user).
+
+**3. Code**
+
+```bash
+npm install -D vitest supertest @types/supertest
+```
+
+```ts
+// vitest.config.ts
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    environment: 'node',
+    // env.ts (9.7) calls process.exit(1) on bad env, so give tests valid values:
+    env: {
+      NODE_ENV: 'test',
+      DATABASE_URL: 'test',
+      JWT_SECRET: 'test-secret-that-is-at-least-32-chars-long',
+    },
+  },
+});
+```
+
+```ts
+// src/services/user.service.test.ts: unit test with the in-memory repo
+import { describe, it, expect } from 'vitest';
+import { UserService } from './user.service.js';
+import { InMemoryUserRepository } from '../repositories/user.repository.js';
+import { NotFoundError } from '../errors/app-error.js';
+
+describe('UserService', () => {
+  it('creates and finds a user', async () => {
+    const service = new UserService(new InMemoryUserRepository());
+    const created = await service.create({
+      name: 'Asha',
+      email: 'asha@example.com',
+    });
+    const found = await service.getById(created.id);
+    expect(found.email).toBe('asha@example.com');
+  });
+
+  it('throws NotFoundError for an unknown id', async () => {
+    const service = new UserService(new InMemoryUserRepository());
+    await expect(service.getById('missing')).rejects.toThrow(NotFoundError);
+  });
+});
+```
+
+```ts
+// src/app.test.ts: integration test, no real port opened
+import { describe, it, expect } from 'vitest';
+import request from 'supertest';
+import { app } from './app.js';
+
+describe('GET /health', () => {
+  it('returns ok', async () => {
+    const res = await request(app).get('/health').expect(200);
+    expect(res.body).toEqual({ status: 'ok' }); // res.body is `any`: validate shape in the test
+  });
+});
+```
+
+**Typed mocks (when a fake class is overkill)**
+
+```ts
+import { vi, type Mocked } from 'vitest';
+import type { UserRepository } from '../repositories/user.repository.js';
+
+const repo: Mocked<UserRepository> = {
+  findById: vi.fn(),
+  findAll: vi.fn(),
+  create: vi.fn(),
+};
+repo.findById.mockResolvedValue(null); // typed: must match Promise<User | null>
+repo.findById.mockResolvedValue({ id: 1 });
+// ❌ TS2345: Argument of type '{ id: number; }' is not assignable to parameter of type 'User | null'.
+const service = new UserService(repo);
+```
+
+The mock is checked against the interface. If you add a method to `UserRepository`, this object stops compiling until you add it. This is the payoff of depending on interfaces (9.8).
+
+**Jest + ts-jest (what you will see in older projects)**
+
+```bash
+npm install -D jest ts-jest @types/jest
+npx ts-jest config:init
+```
+
+```js
+// jest.config.js
+export default { preset: 'ts-jest', testEnvironment: 'node' };
+```
+
+Equivalents: `vi.fn()` is `jest.fn()`, `Mocked<T>` is `jest.Mocked<T>`, and `describe/it/expect` come from globals or `@jest/globals`. ts-jest **does** type check test files (slower, but catches errors). Jest with native ESM and `.js` import extensions needs extra setup (`moduleNameMapper`, experimental flags). This is the main reason newer projects pick Vitest. Config details vary by version, so check the docs.
+
+**4. ❌ Wrong / ✅ Right**
+
+```ts
+// ❌ Tests compiled into dist/ and shipped (they sit in src/ and `include` covers src)
+// ✅ Use a build config that excludes them (see 9.17)
+
+// ❌ A "global" mock cast to hide a mismatch
+const repo = {} as UserRepository; // compiles; crashes when a method is called
+// ✅ Mocked<UserRepository>, or a complete in-memory fake
+```
+
+**5. Real-world use**
+CI runs `npm run typecheck && npm run lint && npm test`. Test the service layer heavily (rules live there), controllers lightly through `supertest`, and repositories against a real test database (or an in-memory one such as `mongodb-memory-server`).
+
+**6. Common mistakes & errors**
+
+- `TS2582: Cannot find name 'describe'` (or `it`, `expect`) → import them from `vitest`, or enable globals: set `test.globals: true` and add `"types": ["vitest/globals"]` to tsconfig. Importing explicitly is the clearer choice.
+- Process exits at import with "Invalid environment variables" → your `env` schema ran in tests without values. Provide them via config (above).
+- Vitest, like `tsx`, **does not type check** (Part 0). Tests can pass while `tsc --noEmit` fails. Run both.
+- Tests share state: `app.ts` creates one in-memory repo at import, so data leaks between tests. Build the app in a `createApp(deps)` function if you need isolation.
+
+**7. Interview tip**
+_"How do you test an Express + TS backend?"_ Unit-test services with fake or mocked repositories, integration-test routes with `supertest` against the exported `app`, and keep `app` separate from `listen`.
+
+---
+
+## 9.16 Intro to NestJS 🟡 GOOD TO KNOW
+
+**1. What it is**
+NestJS is an opinionated Node framework (running on Express or Fastify underneath) built around TypeScript, **decorators** (6.10) and **dependency injection (DI)**. It gives you the structure you built by hand in 9.8 as framework features.
+
+**2. Why it exists**
+Large teams want one standard layout instead of each project inventing its own. Many companies hiring TS backend developers use it, so you should be able to read it.
+
+**3. What changes**
+
+| Your Express project                            | NestJS equivalent                                                                                          |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `router.get("/:id", ...)`                       | `@Get(":id")` on a controller method                                                                       |
+| Controller class, manual wiring in `app.ts`     | `@Controller("users")` + `@Module({ controllers, providers })`                                             |
+| `new UserService(repo)` in the composition root | Nest creates and injects it from the constructor types                                                     |
+| `validateBody(Schema)` middleware               | **Pipes** (`ValidationPipe` with `class-validator` DTO classes; Zod via a custom pipe or a helper library) |
+| Auth middleware                                 | **Guards** (`@UseGuards(AuthGuard)`)                                                                       |
+| Error handler middleware                        | **Exception filters**; throw `NotFoundException` etc.                                                      |
+| Middleware                                      | Middleware, **interceptors** (wrap handlers)                                                               |
+
+```ts
+// users.service.ts
+@Injectable() // "Nest may inject this class"
+export class UsersService {
+  private readonly users = new Map<string, User>();
+
+  findOne(id: string): User {
+    const user = this.users.get(id);
+    if (!user) throw new NotFoundException(`User ${id} not found`);
+    return user;
+  }
+}
+
+// users.controller.ts
+@Controller('users')
+export class UsersController {
+  constructor(private readonly usersService: UsersService) {} // injected by type
+
+  @Get(':id')
+  findOne(@Param('id') id: string): User {
+    return this.usersService.findOne(id); // return a value; Nest sends the JSON
+  }
+
+  @Post()
+  create(@Body() dto: CreateUserDto): User {
+    /* ... */
+  }
+}
+
+// create-user.dto.ts: a CLASS, not an interface (see below)
+export class CreateUserDto {
+  @IsString() @IsNotEmpty() name!: string;
+  @IsEmail() email!: string;
+}
+
+// users.module.ts
+@Module({ controllers: [UsersController], providers: [UsersService] })
+export class UsersModule {}
+```
+
+**Why DTOs are classes here:** types are erased (Part 0), but class decorators emit **runtime metadata**. Nest reads it to validate. An `interface` DTO would vanish and nothing could be validated. This is the same reason `emitDecoratorMetadata` exists.
+
+**tsconfig additions (legacy decorators, see 6.10):**
+
+```json
+{
+  "compilerOptions": {
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
+  }
+}
+```
+
+Nest's generated project sets these (and other options) for you. Confirm the current requirements in the NestJS docs for your version.
+
+**4. ❌ Wrong / ✅ Right**
+
+```ts
+import type { UsersService } from "./users.service";   // ❌ type-only import of an injected class
+constructor(private readonly usersService: UsersService) {}
+// ❌ TS1272: A type referenced in a decorated signature must be imported with 'import type'
+//    or a namespace import when 'isolatedModules' and 'emitDecoratorMetadata' are enabled.
+// (and without the error, DI fails at runtime: Nest can't resolve the dependency)
+import { UsersService } from "./users.service";        // ✅ normal import: Nest needs the real class
+```
+
+The error message wording is confusing, and the fix depends on your flags. Rule: **injected classes need a real (value) import**, not `import type`.
+
+**5. Real-world use**
+Nest fits teams and long-lived APIs. For a small project or a fresher portfolio, plain Express + TS (what you just built) shows you understand the layers; add Nest as a second project.
+
+**6. Common mistakes**
+
+- Forgetting to list a class in `providers`. Runtime error: `Nest can't resolve dependencies of the UsersController (?)`.
+- Treating Nest's decorators as magic. Each one is a label that a framework reads (6.10).
+- Mixing `class-validator` DTOs and Zod without a plan. Pick one validation approach per project.
+
+**7. Interview tip**
+_"What does NestJS add on top of Express?"_ Modules, DI, decorators for routing and validation, and a standard structure (controllers, providers, guards, pipes, filters).
+
+---
+
+## 9.17 Deployment build steps 🔴 MUST KNOW
+
+**1. What it is**
+Turning TS source into something a server runs with plain `node`. The production server never runs `tsx` or `tsc` on the fly (Part 0.3).
+
+**3. The steps**
+
+1. Type check and test (`tsc --noEmit`, `vitest run`).
+2. Compile with `tsc` to `dist/`.
+3. Install **production** dependencies only.
+4. Run `node dist/server.js` with env vars injected by the host.
+
+```json
+// tsconfig.build.json: same config, but exclude tests from the output
+{
+  "extends": "./tsconfig.json",
+  "exclude": ["node_modules", "dist", "src/**/*.test.ts"]
+}
+```
+
+```json
+// package.json scripts
+{
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --enable-source-maps dist/server.js",
+    "test": "vitest run",
+    "ci": "npm run typecheck && npm run lint && npm test && npm run build"
+  }
+}
+```
+
+`--enable-source-maps` makes stack traces point at your `.ts` lines (needs `"sourceMap": true`, already in the Part 0.6 config).
+
+**Dockerfile (multi-stage, common in real jobs)**
+
+```dockerfile
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci                      # installs devDependencies too (typescript, @types/*)
+COPY . .
+RUN npm run build               # with Prisma: also `npx prisma generate` before this
+
+FROM node:20-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package*.json ./
+RUN npm ci --omit=dev           # no typescript, no @types: not needed at runtime
+COPY --from=build /app/dist ./dist
+# With Prisma, also copy the generated client / prisma folder, or run `prisma generate` here
+CMD ["node", "--enable-source-maps", "dist/server.js"]
+```
+
+This is a minimal pattern. Exact Prisma and package-manager steps depend on your versions.
+
+**Hosting notes:** platforms like Render, Railway, Fly.io or AWS take a build command (`npm ci && npm run build`) and a start command (`npm start`). Set env vars in their dashboard, since `.env` is not committed.
+
+**4. ❌ Wrong / ✅ Right**
+
+```
+// ❌ "start": "tsx src/server.ts" in production: slower startup, no type check, dev tool in prod
+// ✅ "start": "node dist/server.js"
+
+// ❌ Alias imports ("@/db") left in dist/*.js  → Error: Cannot find module '@/db' (7.9)
+// ✅ run tsc-alias after tsc, or use relative imports
+
+// ❌ Putting typescript only in devDependencies and then running `tsc` after `npm ci --omit=dev`
+// ✅ build in one stage (with dev deps), run in another (without them)
+```
+
+**5. Real-world use**
+A CI pipeline (GitHub Actions) runs `npm ci` then `npm run ci`, and deploys only if everything passes. Add a `/health` endpoint (9.1) for the host's health checks.
+
+**6. Common mistakes & errors**
+
+- `dist/src/server.js` instead of `dist/server.js` → missing or wrong `rootDir` (TS6059, Part 0.4).
+- `Cannot find module './app'` at runtime in ESM → the import lacked `.js` (7.1). `tsx` can hide this locally; `tsc` flags it (TS2835), so run the build in CI.
+- `ERR_MODULE_NOT_FOUND` for a package → it was in `devDependencies` but needed at runtime. Move it to `dependencies`.
+- Type packages (`@types/*`) are dev-only. If runtime code imports a package, that package is a real dependency.
+
+**7. Interview tip**
+_"How do you deploy a TS Node app?"_ Compile with `tsc` in CI, ship `dist/` plus production dependencies, run with `node`, inject config through environment variables.
+
+---
+
+### 📌 Key Takeaways
+
+- Test services with in-memory or `Mocked<Interface>` repositories, and routes with `supertest` against the exported `app`. Vitest and `tsx` do not type check, so run `tsc --noEmit` too.
+- Give tests valid env values, or your Zod `env` module will exit the process on import.
+- Typed mocks fail to compile when the interface changes. Avoid `{} as Interface`.
+- NestJS formalizes the same layers with modules, DI, decorators, pipes, guards and filters. DTOs are classes (decorators emit metadata) and injected classes need real imports.
+- Production runs compiled JS (`node dist/server.js`). Exclude tests from the build, install production dependencies only, and handle path aliases and Prisma generation as explicit build steps.
+- Run `typecheck`, lint, tests and build in CI before every deploy.
+
+✅ Part 9c complete.
